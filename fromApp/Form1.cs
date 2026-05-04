@@ -87,6 +87,14 @@ namespace fromApp
             {
                 AppendResult($" - {target.Name}");
             }
+            if (schemasResult.SkippedSchemas.Count > 0)
+            {
+                AppendResult("Skipped system schemas:");
+                foreach (var schema in schemasResult.SkippedSchemas)
+                {
+                    AppendResult($" - {schema}");
+                }
+            }
             AppendResult("Running SQL file...");
 
             var executionResult = await _databaseService.ExecuteQueriesAsync(uploadResult.Content, targets);

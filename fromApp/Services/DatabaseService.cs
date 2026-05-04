@@ -111,6 +111,14 @@ namespace fromApp.Services
                                 continue;
                             }
 
+                            var routineDropQuery = BuildDropStatementForCreate(query);
+                            if (!string.IsNullOrWhiteSpace(routineDropQuery))
+                            {
+                                await using var dropCommand = new MySqlCommand(routineDropQuery, connection);
+                                dropCommand.CommandTimeout = 300;
+                                await dropCommand.ExecuteNonQueryAsync();
+                            }
+
                             var executableQuery = MakeInsertDuplicateSafe(query);
 
                             using (var command = new MySqlCommand(executableQuery, connection))
@@ -119,9 +127,7 @@ namespace fromApp.Services
                                 var rowsAffected = await command.ExecuteNonQueryAsync();
                                 result.SuccessfulQueries++;
                                 queryResult.Success = true;
-                                queryResult.Status = executableQuery == query
-                                    ? "Executed"
-                                    : "Executed; duplicate rows skipped";
+                                queryResult.Status = GetSuccessStatus(query, executableQuery, routineDropQuery);
                                 queryResult.RowsAffected = rowsAffected;
                                 result.Details.Add($"Query executed successfully (Rows affected: {rowsAffected})");
                             }
@@ -216,6 +222,35 @@ namespace fromApp.Services
 
             var leadingWhitespaceLength = query.Length - trimmed.Length;
             return query[..leadingWhitespaceLength] + Regex.Replace(trimmed, @"^INSERT\s+", "INSERT IGNORE ", RegexOptions.IgnoreCase);
+        }
+
+        private static string GetSuccessStatus(string originalQuery, string executableQuery, string routineDropQuery)
+        {
+            if (!string.IsNullOrWhiteSpace(routineDropQuery))
+            {
+                return "Recreated";
+            }
+
+            return executableQuery == originalQuery
+                ? "Executed"
+                : "Executed; duplicate rows skipped";
+        }
+
+        private static string BuildDropStatementForCreate(string query)
+        {
+            var match = Regex.Match(
+                query.TrimStart(),
+                @"^CREATE\s+(?:DEFINER\s*=\s*(?:`[^`]+`@`[^`]+`|\S+)\s+)?(?<type>PROCEDURE|FUNCTION|EVENT|TRIGGER)\s+(?:IF\s+NOT\s+EXISTS\s+)?(?<name>`[^`]+`(?:\.`[^`]+`)?|[\w$]+(?:\.[\w$]+)?)",
+                RegexOptions.IgnoreCase);
+
+            if (!match.Success)
+            {
+                return string.Empty;
+            }
+
+            var routineType = match.Groups["type"].Value.ToUpperInvariant();
+            var routineName = match.Groups["name"].Value;
+            return $"DROP {routineType} IF EXISTS {routineName}";
         }
 
         private static List<QueryExecutionDetail> CreateNotRunResults(List<string> queries, string reason)
@@ -351,13 +386,7 @@ namespace fromApp.Services
                 await using var connection = await OpenConnectionAsync(builder.ConnectionString);
                 var schemas = new List<string>();
 
-                const string schemaQuery = """
-                    SELECT SCHEMA_NAME
-                    FROM information_schema.SCHEMATA
-                    ORDER BY SCHEMA_NAME;
-                    """;
-
-                await using (var command = new MySqlCommand(schemaQuery, connection))
+                await using (var command = new MySqlCommand("SHOW DATABASES;", connection))
                 await using (var reader = await command.ExecuteReaderAsync())
                 {
                     while (await reader.ReadAsync())
@@ -371,10 +400,15 @@ namespace fromApp.Services
                     .Distinct(StringComparer.OrdinalIgnoreCase)
                     .Where(s => !excluded.Contains(s, StringComparer.OrdinalIgnoreCase))
                     .ToList();
+                result.SkippedSchemas = schemas
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Where(s => excluded.Contains(s, StringComparer.OrdinalIgnoreCase))
+                    .ToList();
 
                 if (result.Schemas.Count == 0)
                 {
                     result.Schemas = schemas;
+                    result.SkippedSchemas.Clear();
                 }
 
                 result.HasError = false;
@@ -476,6 +510,7 @@ namespace fromApp.Services
         public bool HasError { get; set; }
         public string Message { get; set; } = string.Empty;
         public List<string> Schemas { get; set; } = new();
+        public List<string> SkippedSchemas { get; set; } = new();
     }
 
     public class SchemaExportResult
