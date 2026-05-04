@@ -6,13 +6,23 @@ namespace fromApp.Services
 {
     public class DatabaseService
     {
-        public DatabaseTarget CreateCustomTarget(string name, string host, int port, string database, string user, string password)
+        public DatabaseTarget CreateDefaultServerTarget(string host, int port, string user, string password)
+        {
+            return CreateTarget("Default Server", host, port, string.Empty, user, password);
+        }
+
+        public DatabaseTarget CreateSchemaTarget(string schema, string host, int port, string user, string password)
+        {
+            return CreateTarget(schema, host, port, schema, user, password);
+        }
+
+        private DatabaseTarget CreateTarget(string name, string host, int port, string database, string user, string password)
         {
             var builder = new MySqlConnectionStringBuilder
             {
                 Server = string.IsNullOrWhiteSpace(host) ? "127.0.0.1" : host.Trim(),
-                Port = (uint)(port > 0 ? port : 3306),
-                Database = database.Trim(),
+                Port = (uint)(port > 0 ? port : 3008),
+                Database = (database ?? string.Empty).Trim(),
                 UserID = user.Trim(),
                 Password = password ?? string.Empty,
                 ConnectionProtocol = MySqlConnectionProtocol.Tcp,
@@ -21,11 +31,7 @@ namespace fromApp.Services
                 ConnectionTimeout = 10
             };
 
-            var displayName = string.IsNullOrWhiteSpace(name)
-                ? $"{builder.Database} ({builder.Server}:{builder.Port})"
-                : name.Trim();
-
-            return new DatabaseTarget(displayName, builder.ConnectionString);
+            return new DatabaseTarget(name.Trim(), builder.ConnectionString);
         }
 
         public async Task<ExecutionResult> ExecuteQueriesAsync(string sqlContent, IEnumerable<DatabaseTarget> targets)
@@ -96,13 +102,26 @@ namespace fromApp.Services
                             if (string.IsNullOrWhiteSpace(query))
                                 continue;
 
-                            using (var command = new MySqlCommand(query, connection))
+                            if (IsUseDatabaseStatement(query))
+                            {
+                                queryResult.Success = true;
+                                queryResult.Status = "Skipped";
+                                queryResult.Error = "USE statement skipped so this run stays on the current schema.";
+                                result.QueryResults.Add(queryResult);
+                                continue;
+                            }
+
+                            var executableQuery = MakeInsertDuplicateSafe(query);
+
+                            using (var command = new MySqlCommand(executableQuery, connection))
                             {
                                 command.CommandTimeout = 300;
                                 var rowsAffected = await command.ExecuteNonQueryAsync();
                                 result.SuccessfulQueries++;
                                 queryResult.Success = true;
-                                queryResult.Status = "Executed";
+                                queryResult.Status = executableQuery == query
+                                    ? "Executed"
+                                    : "Executed; duplicate rows skipped";
                                 queryResult.RowsAffected = rowsAffected;
                                 result.Details.Add($"Query executed successfully (Rows affected: {rowsAffected})");
                             }
@@ -169,13 +188,48 @@ namespace fromApp.Services
             {
                 result.Error = $"Cannot connect to {dbName}: {ex.Message}";
                 result.Connected = false;
+                result.QueryResults = CreateNotRunResults(queries, result.Error);
             }
             catch (Exception ex)
             {
                 result.Error = $"Error with {dbName}: {ex.Message}";
+                result.QueryResults = CreateNotRunResults(queries, result.Error);
             }
 
             return result;
+        }
+
+        private static bool IsUseDatabaseStatement(string query)
+        {
+            return Regex.IsMatch(query.TrimStart(), @"^USE\s+[`""]?[\w$]+[`""]?\s*$", RegexOptions.IgnoreCase);
+        }
+
+        private static string MakeInsertDuplicateSafe(string query)
+        {
+            var trimmed = query.TrimStart();
+            if (!Regex.IsMatch(trimmed, @"^INSERT\s+", RegexOptions.IgnoreCase) ||
+                Regex.IsMatch(trimmed, @"^INSERT\s+IGNORE\s+", RegexOptions.IgnoreCase) ||
+                Regex.IsMatch(trimmed, @"\sON\s+DUPLICATE\s+KEY\s+UPDATE\s", RegexOptions.IgnoreCase))
+            {
+                return query;
+            }
+
+            var leadingWhitespaceLength = query.Length - trimmed.Length;
+            return query[..leadingWhitespaceLength] + Regex.Replace(trimmed, @"^INSERT\s+", "INSERT IGNORE ", RegexOptions.IgnoreCase);
+        }
+
+        private static List<QueryExecutionDetail> CreateNotRunResults(List<string> queries, string reason)
+        {
+            return queries
+                .Select((query, index) => new QueryExecutionDetail
+                {
+                    QueryNumber = index + 1,
+                    QueryText = query,
+                    Success = false,
+                    Status = "Not run",
+                    Error = reason
+                })
+                .ToList();
         }
 
         private async Task<MySqlConnection> OpenConnectionAsync(string connectionString)
@@ -228,15 +282,15 @@ namespace fromApp.Services
 
             var delimiter = ";";
             var currentQuery = new StringBuilder();
-            var lines = sqlContent.Split('\n');
-            var inStoredObject = false;
 
-            foreach (var line in lines)
+            foreach (var line in sqlContent.Split('\n'))
             {
                 var trimmedLine = line.Trim();
 
                 if (string.IsNullOrWhiteSpace(trimmedLine))
+                {
                     continue;
+                }
 
                 if (trimmedLine.StartsWith("DELIMITER", StringComparison.OrdinalIgnoreCase))
                 {
@@ -248,83 +302,30 @@ namespace fromApp.Services
                     continue;
                 }
 
-                var upperLine = trimmedLine.ToUpperInvariant();
-                if (!inStoredObject && (upperLine.Contains("CREATE PROCEDURE") ||
-                                       upperLine.Contains("CREATE FUNCTION") ||
-                                       upperLine.Contains("CREATE TRIGGER") ||
-                                       upperLine.Contains("CREATE EVENT")))
+                if (currentQuery.Length > 0)
                 {
-                    inStoredObject = true;
+                    currentQuery.Append('\n');
                 }
-                else if (!inStoredObject && (upperLine.StartsWith("DROP PROCEDURE") ||
-                                            upperLine.StartsWith("DROP FUNCTION") ||
-                                            upperLine.StartsWith("DROP TRIGGER") ||
-                                            upperLine.StartsWith("DROP EVENT")))
+                currentQuery.Append(line);
+
+                var queryText = currentQuery.ToString().Trim();
+                if (!queryText.EndsWith(delimiter, StringComparison.Ordinal))
                 {
-                    var dropQuery = trimmedLine;
-                    if (dropQuery.EndsWith(delimiter, StringComparison.Ordinal))
-                    {
-                        dropQuery = dropQuery.Substring(0, dropQuery.Length - delimiter.Length);
-                    }
-                    if (!string.IsNullOrWhiteSpace(dropQuery))
-                    {
-                        queries.Add(dropQuery.Trim());
-                    }
-                    delimiter = ";";
                     continue;
                 }
 
-                if (currentQuery.Length > 0)
-                    currentQuery.Append("\n");
-
-                currentQuery.Append(line);
-
-                var isEndOfQuery = false;
-                if (inStoredObject)
+                queryText = queryText[..^delimiter.Length].Trim();
+                if (!string.IsNullOrWhiteSpace(queryText))
                 {
-                    if (upperLine.StartsWith("END") && trimmedLine.EndsWith(delimiter, StringComparison.Ordinal))
-                    {
-                        isEndOfQuery = true;
-                        inStoredObject = false;
-                    }
+                    queries.Add(queryText);
                 }
-                else
-                {
-                    if (trimmedLine.EndsWith(delimiter, StringComparison.Ordinal))
-                    {
-                        isEndOfQuery = true;
-                    }
-                }
-
-                if (isEndOfQuery)
-                {
-                    var query = currentQuery.ToString().Trim();
-                    if (query.EndsWith(delimiter, StringComparison.Ordinal))
-                    {
-                        query = query.Substring(0, query.Length - delimiter.Length);
-                    }
-                    query = query.Trim();
-                    if (!string.IsNullOrWhiteSpace(query))
-                    {
-                        queries.Add(query);
-                    }
-                    currentQuery.Clear();
-                    delimiter = ";";
-                }
+                currentQuery.Clear();
             }
 
-            if (currentQuery.Length > 0)
+            var finalQuery = currentQuery.ToString().Trim();
+            if (!string.IsNullOrWhiteSpace(finalQuery))
             {
-                var query = currentQuery.ToString().Trim();
-                if (query.EndsWith(delimiter, StringComparison.Ordinal))
-                {
-                    query = query.Substring(0, query.Length - delimiter.Length);
-                }
-                query = query.Trim();
-                if (!string.IsNullOrWhiteSpace(query))
-                {
-                    queries.Add(query);
-                }
+                queries.Add(finalQuery);
             }
 
             return queries;
@@ -336,6 +337,122 @@ namespace fromApp.Services
             sql = Regex.Replace(sql, @"/\*.*?\*/", string.Empty, RegexOptions.Singleline);
             sql = Regex.Replace(sql, @"#.*?(?=\n|$)", string.Empty, RegexOptions.Multiline);
             return sql;
+        }
+
+        public async Task<SchemaListResult> GetSchemasAsync(string connectionString)
+        {
+            var result = new SchemaListResult();
+
+            try
+            {
+                var builder = new MySqlConnectionStringBuilder(connectionString);
+                builder.Database = string.Empty;
+
+                await using var connection = await OpenConnectionAsync(builder.ConnectionString);
+                var schemas = new List<string>();
+
+                const string schemaQuery = """
+                    SELECT SCHEMA_NAME
+                    FROM information_schema.SCHEMATA
+                    ORDER BY SCHEMA_NAME;
+                    """;
+
+                await using (var command = new MySqlCommand(schemaQuery, connection))
+                await using (var reader = await command.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        schemas.Add(reader.GetString(0));
+                    }
+                }
+
+                var excluded = new[] { "information_schema", "mysql", "performance_schema", "sys" };
+                result.Schemas = schemas
+                    .Distinct(StringComparer.OrdinalIgnoreCase)
+                    .Where(s => !excluded.Contains(s, StringComparer.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (result.Schemas.Count == 0)
+                {
+                    result.Schemas = schemas;
+                }
+
+                result.HasError = false;
+                result.Message = "Schemas loaded successfully.";
+            }
+            catch (Exception ex)
+            {
+                result.HasError = true;
+                result.Message = ex.Message;
+            }
+
+            return result;
+        }
+
+        public async Task<SchemaExportResult> ExportSchemasAsync(string connectionString)
+        {
+            var result = new SchemaExportResult();
+
+            try
+            {
+                var builder = new MySqlConnectionStringBuilder(connectionString);
+                builder.Database = string.Empty;
+
+                await using var connection = await OpenConnectionAsync(builder.ConnectionString);
+                var schemas = new List<string>();
+
+                await using (var command = new MySqlCommand("SHOW DATABASES;", connection))
+                await using (var reader = await command.ExecuteReaderAsync())
+                {
+                    while (await reader.ReadAsync())
+                    {
+                        schemas.Add(reader.GetString(0));
+                    }
+                }
+
+                if (schemas.Count == 0)
+                {
+                    result.HasError = true;
+                    result.Message = "No databases were returned from the server.";
+                    return result;
+                }
+
+                var excluded = new[] { "information_schema", "mysql", "performance_schema", "sys" };
+                var exportSchemas = schemas
+                    .Where(s => !excluded.Contains(s, StringComparer.OrdinalIgnoreCase))
+                    .ToList();
+
+                if (exportSchemas.Count == 0)
+                {
+                    exportSchemas = schemas;
+                }
+
+                var scriptBuilder = new StringBuilder();
+                scriptBuilder.AppendLine("-- Generated schema export file");
+                scriptBuilder.AppendLine($"-- Export date: {DateTime.UtcNow:yyyy-MM-dd HH:mm:ss} UTC");
+                scriptBuilder.AppendLine();
+
+                foreach (var schema in exportSchemas)
+                {
+                    var quotedName = QuoteIdentifier(schema);
+                    scriptBuilder.AppendLine($"CREATE DATABASE IF NOT EXISTS {quotedName};");
+                }
+
+                scriptBuilder.AppendLine();
+                scriptBuilder.AppendLine("-- End of schema export");
+
+                result.HasError = false;
+                result.Message = "Schema export script generated successfully.";
+                result.Schemas = exportSchemas;
+                result.SqlScript = scriptBuilder.ToString();
+            }
+            catch (Exception ex)
+            {
+                result.HasError = true;
+                result.Message = ex.Message;
+            }
+
+            return result;
         }
 
         public async Task<bool> TestConnectionAsync(string connectionString)
@@ -353,6 +470,21 @@ namespace fromApp.Services
     }
 
     public record DatabaseTarget(string Name, string ConnectionString, string Key = "");
+
+    public class SchemaListResult
+    {
+        public bool HasError { get; set; }
+        public string Message { get; set; } = string.Empty;
+        public List<string> Schemas { get; set; } = new();
+    }
+
+    public class SchemaExportResult
+    {
+        public bool HasError { get; set; }
+        public string Message { get; set; } = string.Empty;
+        public List<string> Schemas { get; set; } = new();
+        public string SqlScript { get; set; } = string.Empty;
+    }
 
     public class DatabaseTargetStatus
     {

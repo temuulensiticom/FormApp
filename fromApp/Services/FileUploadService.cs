@@ -71,6 +71,44 @@ namespace fromApp.Services
             return result;
         }
 
+        public async Task<FileUploadResult> SaveGeneratedFileAsync(string content, string fileNameHint)
+        {
+            var result = new FileUploadResult();
+
+            try
+            {
+                var cleanHint = string.Join("_", fileNameHint.Split(Path.GetInvalidFileNameChars(), StringSplitOptions.RemoveEmptyEntries));
+                var fileName = string.IsNullOrWhiteSpace(cleanHint) ? "generated_schemas.sql" : $"{cleanHint}.sql";
+                var destinationPath = Path.Combine(_uploadFolder, fileName);
+                var fileIndex = 1;
+
+                while (File.Exists(destinationPath))
+                {
+                    var nameWithoutExt = Path.GetFileNameWithoutExtension(fileName);
+                    fileName = $"{nameWithoutExt}_{fileIndex}.sql";
+                    destinationPath = Path.Combine(_uploadFolder, fileName);
+                    fileIndex++;
+                    result.IsDuplicate = true;
+                    result.DuplicateMessage = $"File name already exists. Saved as: {fileName}";
+                }
+
+                await File.WriteAllTextAsync(destinationPath, content, Encoding.UTF8);
+
+                result.FileName = fileName;
+                result.FilePath = destinationPath;
+                result.Content = content;
+                result.HasError = false;
+                result.Message = "Generated SQL file saved successfully.";
+            }
+            catch (Exception ex)
+            {
+                result.HasError = true;
+                result.Message = $"Error saving generated file: {ex.Message}";
+            }
+
+            return result;
+        }
+
         private ValidationResult ValidateFile(string filePath)
         {
             if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
